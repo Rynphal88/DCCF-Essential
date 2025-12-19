@@ -1,28 +1,13 @@
 // src/app/api/compass/summary/route.ts
 
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
-import type {
-  CompassState,
-  QuadrantData,
-  QuadrantId,
-} from "@/components/contribution/types";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { CompassState, QuadrantData, QuadrantId } from "@/components/contribution/types";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseKey =
-  process.env.SUPABASE_SERVICE_ROLE_KEY ??
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-if (!supabaseUrl || !supabaseKey) {
-  console.warn(
-    "[/api/compass/summary] Supabase env vars missing. Check NEXT_PUBLIC_SUPABASE_URL and SUPABASE keys."
-  );
-}
-
-const supabase =
-  supabaseUrl && supabaseKey
-    ? createClient(supabaseUrl, supabaseKey)
-    : null;
+// Ensure this route is always evaluated dynamically (no static caching surprises)
+export const dynamic = "force-dynamic";
+// Ensure we run on Node.js (supabase-js is happiest here)
+export const runtime = "nodejs";
 
 interface CompassRow {
   quadrants: Record<QuadrantId, QuadrantData> | null;
@@ -117,6 +102,41 @@ function getFallbackCompassState(): CompassState {
 }
 
 /**
+ * Build Supabase client safely at request-time.
+ * - Prevents noisy build-time warnings
+ * - Avoids creating clients when env is missing
+ */
+function getSupabaseClient(): {
+  client: SupabaseClient | null;
+  note?: string;
+} {
+  const url =
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.SUPABASE_URL || // backwards-compat for local dev
+    "";
+
+  const anonKey =
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY || // backwards-compat for local dev
+    "";
+
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+  // Prefer service role only when provided (server-only). Otherwise use anon.
+  const key = serviceKey || anonKey;
+
+  if (!url || !key) {
+    return {
+      client: null,
+      note:
+        "Supabase not configured. Expected NEXT_PUBLIC_SUPABASE_URL + NEXT_PUBLIC_SUPABASE_ANON_KEY (and optionally SUPABASE_SERVICE_ROLE_KEY).",
+    };
+  }
+
+  return { client: createClient(url, key) };
+}
+
+/**
  * Compass summary endpoint returning the full CompassState shape.
  *
  * Expected body:
@@ -127,6 +147,11 @@ function getFallbackCompassState(): CompassState {
  * }
  */
 export async function POST(req: Request) {
+  // Always return fresh data (no caching)
+  const noStoreHeaders = {
+    "Cache-Control": "no-store, max-age=0",
+  };
+
   try {
     const body = (await req.json().catch(() => ({}))) as {
       path?: string;
@@ -135,25 +160,33 @@ export async function POST(req: Request) {
     };
 
     const path =
-      typeof body.path === "string" && body.path.length > 0 ? body.path : "/";
+      typeof body.path === "string" && body.path.trim().length > 0
+        ? body.path.trim()
+        : "/";
+
     const source =
-      typeof body.source === "string" && body.source.length > 0
-        ? body.source
+      typeof body.source === "string" && body.source.trim().length > 0
+        ? body.source.trim()
         : "global-assistant";
+
     const userId =
-      typeof body.userId === "string" && body.userId.length > 0
-        ? body.userId
+      typeof body.userId === "string" && body.userId.trim().length > 0
+        ? body.userId.trim()
         : undefined;
 
+    const { client: supabase, note } = getSupabaseClient();
+
+    // If Supabase isn’t configured, return a clean fallback — no scary build-time warnings
     if (!supabase) {
       return NextResponse.json(
         {
+          ok: true,
           path,
           source,
           compass: getFallbackCompassState(),
-          note: "Supabase not configured; serving fallback Compass state.",
+          note: note ?? "Supabase not configured; serving fallback Compass state.",
         },
-        { status: 200 }
+        { status: 200, headers: noStoreHeaders }
       );
     }
 
@@ -166,65 +199,64 @@ export async function POST(req: Request) {
       .order("updated_at", { ascending: false })
       .limit(1);
 
-    if (userId) {
-      query = query.eq("user_id", userId);
-    }
-
-    if (path && path !== "/") {
-      query = query.eq("path", path);
-    }
+    if (userId) query = query.eq("user_id", userId);
+    if (path && path !== "/") query = query.eq("path", path);
 
     const { data, error } = await query.maybeSingle();
 
     if (error) {
+      // Log, but still respond with fallback so UI remains stable
       console.error("[/api/compass/summary] Supabase error:", error);
+      return NextResponse.json(
+        {
+          ok: true,
+          path,
+          source,
+          compass: getFallbackCompassState(),
+          note: "Supabase query failed; serving fallback Compass state.",
+        },
+        { status: 200, headers: noStoreHeaders }
+      );
     }
 
     const row = (data as CompassRow | null) ?? null;
 
-    let compass: CompassState;
+    const fallback = getFallbackCompassState();
 
-    if (!row) {
-      compass = getFallbackCompassState();
-    } else {
-      const fallback = getFallbackCompassState();
-      compass = {
-        quadrants: row.quadrants ?? fallback.quadrants,
-        overallAlignment:
-          typeof row.overall_alignment === "number" &&
-          !Number.isNaN(row.overall_alignment)
-            ? row.overall_alignment
-            : 50,
-        researchDrift:
-          typeof row.research_drift === "number" &&
-          !Number.isNaN(row.research_drift)
-            ? row.research_drift
-            : 25,
-        weeklyMomentum:
-          typeof row.weekly_momentum === "number" &&
-          !Number.isNaN(row.weekly_momentum)
-            ? row.weekly_momentum
-            : 0,
-        nextBestAction: row.next_best_action ?? fallback.nextBestAction,
-        aiInsights: Array.isArray(row.ai_insights)
-          ? row.ai_insights
-          : fallback.aiInsights,
-      };
-    }
+    const compass: CompassState = !row
+      ? fallback
+      : {
+          quadrants: row.quadrants ?? fallback.quadrants,
+          overallAlignment:
+            typeof row.overall_alignment === "number" && !Number.isNaN(row.overall_alignment)
+              ? row.overall_alignment
+              : fallback.overallAlignment,
+          researchDrift:
+            typeof row.research_drift === "number" && !Number.isNaN(row.research_drift)
+              ? row.research_drift
+              : fallback.researchDrift,
+          weeklyMomentum:
+            typeof row.weekly_momentum === "number" && !Number.isNaN(row.weekly_momentum)
+              ? row.weekly_momentum
+              : fallback.weeklyMomentum,
+          nextBestAction: row.next_best_action ?? fallback.nextBestAction,
+          aiInsights: Array.isArray(row.ai_insights) ? row.ai_insights : fallback.aiInsights,
+        };
 
     return NextResponse.json(
       {
+        ok: true,
         path,
         source,
         compass,
       },
-      { status: 200 }
+      { status: 200, headers: noStoreHeaders }
     );
   } catch (err) {
     console.error("[API /compass/summary] Unexpected error:", err);
     return NextResponse.json(
-      { error: "Unable to load Compass state." },
-      { status: 500 }
+      { ok: false, error: "Unable to load Compass state." },
+      { status: 500, headers: noStoreHeaders }
     );
   }
 }
